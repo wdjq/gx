@@ -1,0 +1,207 @@
+name: 更新通知
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: 检查更新
+        env:
+          QMSG_KEY: ${{ secrets.QMSG_KEY }}
+          QMSG_QQ: ${{ secrets.QMSG_QQ }}
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # ============= 配置和验证 =============
+          echo "===== 开始检查仓库: ${TARGET_REPO} ====="
+          
+          if [ -z "$TARGET_REPO" ]; then
+            echo "❌ 错误: TARGET_REPO未设置"
+            exit 1
+          fi
+          
+          if [ ! -f last_commit.txt ]; then
+            echo "❌ 错误: last_commit.txt文件不存在"
+            exit 1
+          fi
+          
+          last_commit=$(cat last_commit.txt | tr -d ' \n')
+          if [ -z "$last_commit" ]; then
+            echo "❌ 错误: last_commit.txt内容为空"
+            exit 1
+          fi
+          
+          if [[ ! "$last_commit" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "❌ 错误: last_commit.txt内容不是有效的commit SHA"
+            exit 1
+          fi
+          
+          echo "上次记录: ${last_commit:0:7}"
+          
+
+          echo "步骤1: 检查新提交..."
+          
+          all_commits=()
+          page=1
+          
+          while :; do
+            retry=3
+            while [ $retry -gt 0 ]; do
+              response=$(curl -s -w "\n%{http_code}" \
+                --max-time 30 \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${TARGET_REPO}/commits?per_page=100&page=$page")
+              
+              http_code=$(echo "$response" | tail -n1)
+              body=$(echo "$response" | sed '$d')
+              
+              if [ "$http_code" = "200" ] && echo "$body" | jq -e '.[0].sha' >/dev/null 2>&1; then
+                break
+              fi
+              
+              retry=$((retry - 1))
+              [ $retry -gt 0 ] && sleep 3
+            done
+            
+            if [ $retry -eq 0 ]; then
+              echo "❌ 获取提交失败（HTTP $http_code）"
+              exit 1
+            fi
+            
+            commit_shas=$(echo "$body" | jq -r '.[].sha')
+            if [ -z "$commit_shas" ]; then
+              break
+            fi
+            
+            found_old=false
+            for sha in $commit_shas; do
+              if [ "$sha" = "$last_commit" ]; then
+                found_old=true
+                break
+              fi
+              all_commits+=("$sha")
+            done
+            
+            [ "$found_old" = true ] && break
+            page=$((page + 1))
+            
+            if [ $page -gt 10 ]; then
+              echo "⚠️ 达到最大查询深度"
+              break
+            fi
+          done
+          
+          new_count=${#all_commits[@]}
+          if [ $new_count -eq 0 ]; then
+            echo "✓ 暂无更新"
+            exit 0
+          fi
+          
+          echo "发现 $new_count 个新提交"
+          
+          
+          all_msgs="📢 仓库更新通知%0A"
+          msg_count=0
+          
+          for ((i=new_count-1; i>=0; i--)); do
+            commit_sha="${all_commits[i]}"
+            msg_count=$((msg_count + 1))
+            
+            retry=3
+            while [ $retry -gt 0 ]; do
+              commit_detail=$(curl -s --max-time 20 \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                "https://api.github.com/repos/${TARGET_REPO}/commits/${commit_sha}")
+              
+              if echo "$commit_detail" | jq -e '.sha' >/dev/null 2>&1; then
+                break
+              fi
+              
+              retry=$((retry - 1))
+              [ $retry -gt 0 ] && sleep 2
+            done
+            
+            commit_time=$(echo "$commit_detail" | jq -r '.commit.author.date' | sed 's/T/ /' | cut -d'+' -f1)
+            bj_time=$(date -d "$commit_time" +'%Y-%m-%d %H:%M' 2>/dev/null || echo "$commit_time")
+            
+            all_files=$(echo "$commit_detail" | jq -r '.files // [] | .[].filename' 2>/dev/null)
+            file_count=$(echo "$all_files" | grep -c '^' || echo 0)
+            
+            if [ "$file_count" -eq 0 ]; then
+              file_list="• （无文件变更）"
+            else
+              display_files=$(echo "$all_files" | head -5)
+              file_list=$(echo "$display_files" | sed 's/^/• /')
+              if [ "$file_count" -gt 5 ]; then
+                remaining=$((file_count - 5))
+                file_list="${file_list}%0A...（还有${remaining}个）"
+              fi
+            fi
+            
+            msg_block="%0A%0A【更新 #${msg_count}】%0A⏰ 时间：${bj_time}%0A🔖 Commit：${commit_sha:0:7}%0A📁 文件：${file_count}个%0A${file_list}"
+            all_msgs="${all_msgs}${msg_block}"
+            
+            echo "已添加: ${commit_sha:0:7}"
+          done
+          
+          all_msgs="${all_msgs}%0A%0A✅ 共 ${msg_count} 次更新"
+          
+          
+          echo "步骤2: 内容安全检测..."
+          
+          SEPARATOR="😂"
+          
+          echo "使用分隔符: $SEPARATOR"
+          
+          
+          safe_msg=$(echo "$all_msgs" | sed "s/2b/2${SEPARATOR}b/g; s/2B/2${SEPARATOR}B/g")
+          
+          safe_msg=$(echo "$safe_msg" | sed "s/sb/s${SEPARATOR}b/g; s/SB/S${SEPARATOR}B/g")
+          
+          safe_msg=$(echo "$safe_msg" | sed 's/\([0-9]\)b/\1'${SEPARATOR}'b/g')
+          
+          echo "原消息长度: ${#all_msgs} -> ${#safe_msg}"
+          
+          
+          echo "步骤3: 发送通知到QQ..."
+          send_result=$(curl -s --max-time 30 -X POST "https://qmsg.zendee.cn/send/${QMSG_KEY}" \
+            -d "msg=${safe_msg}" \
+            -d "qq=${QMSG_QQ}")
+          
+          if echo "$send_result" | grep -q '"success":true'; then
+            echo "✅ 通知发送成功"
+          else
+            echo "❌ 通知发送失败: $send_result"
+            exit 1
+          fi
+          
+          
+          latest_commit="${all_commits[0]}"
+          echo "$latest_commit" > last_commit.txt
+          
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
+          
+          git add last_commit.txt
+          if git diff --staged --quiet; then
+            echo "⚠️ 记录未变化"
+          else
+            git commit -m "更新记录: ${latest_commit:0:7}"
+            git push && echo "✅ 记录已保存" || echo "❌ 推送失败"
+          fi
+          
+          echo "===== 检查完成 ====="
