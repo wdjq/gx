@@ -1,0 +1,28 @@
+name: 活跃
+
+on:
+  schedule:
+    - cron: '0 2 */15 * *' 
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        
+      - name: 更新时间戳
+        run: |
+          mkdir -p .github
+          date +"%Y-%m-%d %H:%M:%S UTC" > .github/last_alive.txt
+          
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          
+          git add .github/last_alive.txt
+          git commit -m "活跃: $(date +%Y%m%d-%H%M)"
+          
+          git push
